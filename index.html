@@ -1,0 +1,864 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Neon Pulse Pong</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    background: #050407; color: #e7fae3;
+    font-family: 'Courier New', Courier, monospace;
+    overflow: hidden; touch-action: none;
+    display: flex; align-items: center; justify-content: center;
+  }
+  #gameWrap {
+    position: relative;
+    display: flex; align-items: center; justify-content: center;
+  }
+  canvas {
+    background: #050407;
+    box-shadow: 0 0 28px rgba(0,255,128,0.18), inset 0 0 18px rgba(0,255,128,0.06);
+    border: 2px solid #172e22;
+    border-radius: 6px;
+  }
+  #hint {
+    position: absolute; bottom: -34px; left: 0; right: 0; text-align: center;
+    font-size: 13px; color: #4d6b5a; pointer-events: none; user-select: none;
+  }
+</style>
+</head>
+<body>
+<div id="gameWrap">
+  <canvas id="c"></canvas>
+  <div id="hint">Click / Tap to start • Mouse, touch or ↑↓ keys to move</div>
+</div>
+<script>
+(() => {
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+
+  // Base design resolution and responsive scale
+  const BASE_W = 960;
+  const BASE_H = 540;
+  let SCALE = 1;
+
+  function resize() {
+    const margin = 32;
+    const maxW = window.innerWidth - margin * 2;
+    const maxH = window.innerHeight - margin * 2 - 48; // leave room for hint
+    const s = Math.min(maxW / BASE_W, maxH / BASE_H, 1.55);
+    SCALE = Math.max(0.55, s);
+    canvas.width = Math.floor(BASE_W * SCALE);
+    canvas.height = Math.floor(BASE_H * SCALE);
+    canvas.style.width = canvas.width + 'px';
+    canvas.style.height = canvas.height + 'px';
+  }
+  resize();
+  window.addEventListener('resize', resize);
+
+  // Audio context and acid techno music engine
+  let audioCtx = null;
+  let musicGain = null;
+  let sfxGain = null;
+  let nextStepTime = 0;
+  let stepIdx = 0;
+  let barIdx = 0;
+  let filterSweepVal = 0;
+  const BPM = 126;
+  const STEPS_PER_BAR = 16;
+  const SECS_PER_STEP = 60 / BPM / 4; // 16th note
+
+  const ROOT = 55; // A1
+  const BASS_PATTERNS = [
+    [0, 0, 12, 0, 0, 0, 0, 5, 0, 0, 12, 0, 7, 0, 10, 0],
+    [0, 0, 3, 0, 5, 0, 3, 0, 0, 0, 7, 0, 5, 0, 3, 0],
+    [0, 12, 0, 10, 0, 7, 0, 5, 0, 12, 0, 10, 0, 7, 0, 3],
+    [0, 0, 0, 0, 3, 0, 0, 5, 0, 0, 0, 0, 7, 0, 0, 3],
+    [0, 0, 15, 0, 0, 0, 12, 0, 0, 0, 10, 0, 0, 0, 7, 0],
+    [0, 5, 3, 0, 0, 7, 5, 0, 0, 3, 5, 0, 0, 7, 3, 0],
+    [0, 0, 0, 12, 0, 0, 10, 0, 0, 0, 7, 0, 0, 0, 5, 0],
+    [3, 0, 7, 0, 10, 0, 7, 0, 3, 0, 5, 0, 12, 0, 10, 0]
+  ];
+  const PAD_CHORDS = [
+    { root: 0, type: 'min' }, { root: -1, type: 'maj' },
+    { root: -4, type: 'maj' }, { root: 0, type: 'min' },
+    { root: -7, type: 'min' }, { root: -6, type: 'maj' },
+    { root: -4, type: 'maj' }, { root: 0, type: 'min' }
+  ];
+  const ARP_PATTERNS = [
+    null, null,
+    [0, 12, 7, 12, 3, 12, 7, 12], null,
+    [0, 7, 3, 7, 12, 7, 3, 7], [0, 3, 7, 12, 7, 3, 7, 12],
+    null,
+    [0, 7, 12, 7, 3, 7, 12, 7]
+  ];
+
+  function midiToFreq(midi) { return 440 * Math.pow(2, (midi - 69) / 12); }
+
+  function noteFromMidi(midi, when, dur, gain, type = 'sawtooth', filter = null, q = 1, slideTo = null) {
+    const o = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    const f = audioCtx.createBiquadFilter();
+    o.type = type;
+    o.frequency.setValueAtTime(midiToFreq(midi), when);
+    if (slideTo !== null) {
+      o.frequency.exponentialRampToValueAtTime(Math.max(20, midiToFreq(slideTo)), when + dur);
+    }
+    f.type = 'lowpass';
+    f.frequency.value = filter !== null ? filter : 1200;
+    f.Q.value = q;
+    g.gain.setValueAtTime(0, when);
+    g.gain.linearRampToValueAtTime(gain, when + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.001, when + dur);
+    o.connect(f).connect(g).connect(musicGain);
+    o.start(when);
+    o.stop(when + dur + 0.05);
+  }
+
+  function noiseBurst(when, dur, gain, freq, type = 'bandpass') {
+    const buf = audioCtx.createBuffer(1, audioCtx.sampleRate * dur, audioCtx.sampleRate);
+    const data = buf.getChannelData(0);
+    for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
+    const src = audioCtx.createBufferSource();
+    src.buffer = buf;
+    const g = audioCtx.createGain();
+    const f = audioCtx.createBiquadFilter();
+    f.type = type;
+    f.frequency.value = freq;
+    f.Q.value = type === 'highpass' ? 1.2 : 1.5;
+    g.gain.setValueAtTime(0, when);
+    g.gain.linearRampToValueAtTime(gain, when + 0.005);
+    g.gain.exponentialRampToValueAtTime(0.001, when + dur);
+    src.connect(f).connect(g).connect(musicGain);
+    src.start(when);
+    src.stop(when + dur + 0.05);
+  }
+
+  function kick(when) {
+    const o = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    o.frequency.setValueAtTime(150, when);
+    o.frequency.exponentialRampToValueAtTime(40, when + 0.12);
+    g.gain.setValueAtTime(0.55, when);
+    g.gain.exponentialRampToValueAtTime(0.001, when + 0.18);
+    o.connect(g).connect(musicGain);
+    o.start(when); o.stop(when + 0.2);
+  }
+
+  function acid303(when, midi, dur, gain, cutoff, slideTo = null) {
+    const o = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    const f = audioCtx.createBiquadFilter();
+    o.type = 'sawtooth';
+    const base = midiToFreq(midi);
+    o.frequency.setValueAtTime(base, when);
+    if (slideTo !== null) {
+      o.frequency.exponentialRampToValueAtTime(Math.max(30, midiToFreq(slideTo)), when + dur * 0.85);
+    }
+    f.type = 'lowpass';
+    f.frequency.setValueAtTime(cutoff, when);
+    f.Q.value = 4.5;
+    f.frequency.exponentialRampToValueAtTime(Math.max(220, cutoff * 0.7), when + dur * 0.9);
+    g.gain.setValueAtTime(0, when);
+    g.gain.linearRampToValueAtTime(gain, when + 0.005);
+    g.gain.setValueAtTime(gain * 0.8, when + dur - 0.02);
+    g.gain.exponentialRampToValueAtTime(0.001, when + dur + 0.05);
+    o.connect(f).connect(g).connect(musicGain);
+    o.start(when); o.stop(when + dur + 0.1);
+  }
+
+  function padChord(when, chord) {
+    const notes = chord.type === 'min'
+      ? [chord.root, chord.root + 3, chord.root + 7, chord.root + 12]
+      : [chord.root, chord.root + 4, chord.root + 7, chord.root + 12];
+    notes.forEach((off, i) => {
+      const fbase = midiToFreq(ROOT + 24 + off);
+      const o = audioCtx.createOscillator();
+      const g = audioCtx.createGain();
+      const f = audioCtx.createBiquadFilter();
+      o.type = 'triangle';
+      o.frequency.value = fbase;
+      f.type = 'lowpass';
+      f.frequency.value = 520;
+      f.Q.value = 0.6;
+      const stagger = i * 0.04;
+      g.gain.setValueAtTime(0, when + stagger);
+      g.gain.linearRampToValueAtTime(0.045, when + stagger + 0.25);
+      g.gain.exponentialRampToValueAtTime(0.001, when + 1.95);
+      o.connect(f).connect(g).connect(musicGain);
+      o.start(when + stagger); o.stop(when + 2.0);
+    });
+  }
+
+  function scheduleMusic(upTo) {
+    while (nextStepTime < upTo + 0.25) {
+      const when = nextStepTime;
+      const pat = BASS_PATTERNS[barIdx];
+      const noteOff = pat[stepIdx];
+      const sweepBase = 260 + Math.sin(filterSweepVal) * 180;
+
+      // Kick on every beat
+      if (stepIdx % 4 === 0) kick(when);
+      // Closed hats
+      if (stepIdx % 2 === 1) noiseBurst(when, 0.045, 0.18, 8200, 'highpass');
+      // Claps on beat 4 (step 12)
+      if (stepIdx === 12) noiseBurst(when, 0.12, 0.13, 1500, 'bandpass');
+      // Open hats on bars 2 and 6
+      if ((barIdx === 1 || barIdx === 5) && stepIdx === 6) noiseBurst(when, 0.16, 0.10, 9800, 'highpass');
+
+      // Bass / acid 303
+      if (noteOff !== 0) {
+        const midi = ROOT + noteOff;
+        const nextOff = pat[(stepIdx + 1) % STEPS_PER_BAR];
+        const slideTo = nextOff !== 0 ? ROOT + nextOff : null;
+        acid303(when, midi, SECS_PER_STEP * 0.92, 0.16, sweepBase, slideTo);
+      }
+
+      // Squelch on bars 3 and 7, steps 7 and 15
+      if ((barIdx === 2 || barIdx === 6) && (stepIdx === 7 || stepIdx === 15)) {
+        noteFromMidi(ROOT + 24, when, 0.18, 0.12, 'square', 900, 8, ROOT + 12);
+      }
+
+      // Arp fills
+      const arp = ARP_PATTERNS[barIdx];
+      if (arp && stepIdx >= 8) {
+        const arpIdx = stepIdx - 8;
+        if (arpIdx < arp.length && arpIdx % 2 === 0) {
+          acid303(when, ROOT + 24 + arp[arpIdx], SECS_PER_STEP * 0.7, 0.10, sweepBase + 300);
+        }
+      }
+
+      // Pad chord at start of each bar
+      if (stepIdx === 0) padChord(when, PAD_CHORDS[barIdx]);
+
+      // Riser on bar 8
+      if (barIdx === 7) {
+        const riserGain = 0.06 * (stepIdx / STEPS_PER_BAR);
+        noteFromMidi(ROOT + 12 + stepIdx, when, SECS_PER_STEP, riserGain, 'sawtooth', 400 + stepIdx * 60, 1.5);
+      }
+
+      nextStepTime += SECS_PER_STEP;
+      stepIdx++;
+      if (stepIdx >= STEPS_PER_BAR) {
+        stepIdx = 0;
+        barIdx = (barIdx + 1) % BASS_PATTERNS.length;
+        filterSweepVal += 0.65;
+      }
+    }
+  }
+
+  function sfx(name) {
+    if (!audioCtx) return;
+    const now = audioCtx.currentTime;
+    if (name === 'paddle') {
+      noteFromMidi(82, now, 0.09, 0.25, 'sine', 1200, 2, 76);
+      noiseBurst(now, 0.05, 0.08, 2500, 'bandpass');
+    } else if (name === 'wall') {
+      noteFromMidi(60, now, 0.12, 0.18, 'square', 600, 3, 40);
+    } else if (name === 'score') {
+      noteFromMidi(96, now, 0.20, 0.22, 'sine', 2000, 1, 84);
+      setTimeout(() => noteFromMidi(108, audioCtx.currentTime, 0.25, 0.18, 'sine', 2500, 1, 96), 100);
+    } else if (name === 'powerup') {
+      noteFromMidi(72, now, 0.08, 0.20, 'sine', 1500, 2, 84);
+      setTimeout(() => noteFromMidi(84, audioCtx.currentTime, 0.10, 0.18, 'sine', 1800, 2, 96), 90);
+      setTimeout(() => noteFromMidi(96, audioCtx.currentTime, 0.12, 0.15, 'sine', 2200, 2, 108), 180);
+    } else if (name === 'explode') {
+      noiseBurst(now, 0.35, 0.35, 180, 'lowpass');
+      noteFromMidi(36, now, 0.30, 0.25, 'sawtooth', 300, 1, 24);
+    }
+  }
+
+  function startAudio() {
+    if (audioCtx) { if (audioCtx.state === 'suspended') audioCtx.resume(); return; }
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    musicGain = audioCtx.createGain();
+    musicGain.gain.value = 0.32;
+    sfxGain = audioCtx.createGain();
+    sfxGain.gain.value = 1.0;
+    const master = audioCtx.createGain();
+    master.gain.value = 0.85;
+    const comp = audioCtx.createDynamicsCompressor();
+    comp.threshold.value = -18;
+    comp.knee.value = 8;
+    comp.ratio.value = 6;
+    comp.attack.value = 0.003;
+    comp.release.value = 0.15;
+    musicGain.connect(comp);
+    sfxGain.connect(comp);
+    comp.connect(master);
+    master.connect(audioCtx.destination);
+    nextStepTime = audioCtx.currentTime + 0.05;
+    stepIdx = 0; barIdx = 0; filterSweepVal = 0;
+  }
+
+  // Game state
+  const State = {
+    mode: 'title', // title, serve, play, over
+    lastTime: 0,
+    accumulator: 0,
+    dt: 1000 / 60,
+    scorePlayer: 0,
+    scoreAI: 0,
+    winningScore: 7,
+    shake: 0,
+    messages: [],
+    particles: [],
+    powerups: [],
+    activePowers: { player: null, ai: null },
+    level: 1,
+    servedBy: 1 // 1 = player serves, -1 = AI serves
+  };
+
+  const Paddle = { w: 18, h: 86, speed: 8.2, aiSpeedBase: 6.6 };
+  const Ball = { r: 8, speedBase: 9.5, speedMax: 19 };
+
+  const p1 = { x: 40, y: BASE_H / 2, score: 0, w: Paddle.w, h: Paddle.h, vy: 0 };
+  const p2 = { x: BASE_W - 40, y: BASE_H / 2, score: 0, w: Paddle.w, h: Paddle.h, vy: 0 };
+  const ball = { x: BASE_W / 2, y: BASE_H / 2, vx: 0, vy: 0, r: Ball.r, spin: 0, trail: [] };
+
+  const keys = {};
+  let mouseY = BASE_H / 2;
+  let touchY = BASE_H / 2;
+  let usingTouch = false;
+
+  // Power-up types
+  const POWERS = {
+    BIG_PADDLE: { color: '#00ff88', label: 'BIG', duration: 8000, apply(p) { p.h = Math.min(180, Paddle.h * 1.55); }, reset(p) { p.h = Paddle.h; } },
+    SMALL_PADDLE: { color: '#ff4d4d', label: 'MINI', duration: 6000, apply(p) { p.h = Math.max(38, Paddle.h * 0.55); }, reset(p) { p.h = Paddle.h; } },
+    SPEED_UP: { color: '#ffcc00', label: 'FAST', duration: 5000, apply() {}, reset() {} }, // affects ball on next hit
+    SLOW_MO: { color: '#00ccff', label: 'SLOW', duration: 5000, apply() {}, reset() {} }
+  };
+
+  function resetBall(server) {
+    ball.x = server === 1 ? p1.x + 60 : p2.x - 60;
+    ball.y = BASE_H / 2;
+    ball.vx = server * Ball.speedBase * 0.65;
+    ball.vy = (Math.random() - 0.5) * 4;
+    ball.spin = 0;
+    ball.trail = [];
+  }
+
+  function resetGame() {
+    p1.y = BASE_H / 2; p2.y = BASE_H / 2;
+    p1.h = Paddle.h; p2.h = Paddle.h;
+    State.scorePlayer = 0; State.scoreAI = 0;
+    State.messages = []; State.particles = []; State.powerups = [];
+    State.activePowers = { player: null, ai: null };
+    State.level = 1;
+    resetBall(1);
+    State.servedBy = 1;
+  }
+
+  function spawnMessage(text, x, y, color) {
+    State.messages.push({ text, x, y, life: 60, color });
+  }
+
+  function spawnParticles(x, y, color, count = 24) {
+    for (let i = 0; i < count; i++) {
+      const a = Math.random() * Math.PI * 2;
+      const s = 2 + Math.random() * 5;
+      State.particles.push({
+        x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s,
+        life: 30 + Math.random() * 20, color, size: 2 + Math.random() * 3
+      });
+    }
+  }
+
+  function maybeSpawnPowerup(x, y) {
+    if (Math.random() > 0.28) return;
+    const keys = Object.keys(POWERS);
+    const type = keys[Math.floor(Math.random() * keys.length)];
+    State.powerups.push({ x, y, vx: (Math.random() - 0.5) * 2, vy: 1.2 + Math.random(), type, life: 600, pulse: 0 });
+  }
+
+  function applyPowerup(side, typeKey) {
+    const target = side === 'player' ? p1 : p2;
+    const opp = side === 'player' ? p2 : p1;
+    const info = POWERS[typeKey];
+    const active = side === 'player' ? State.activePowers.player : State.activePowers.ai;
+    if (active && active.reset) active.reset(target);
+    const entry = { key: typeKey, until: performance.now() + info.duration, info };
+    if (side === 'player') State.activePowers.player = entry; else State.activePowers.ai = entry;
+    info.apply(target);
+    sfx('powerup');
+    spawnMessage(info.label, target.x, target.y - target.h / 2 - 18, info.color);
+
+    // Some power-ups affect opponent negatively
+    if (typeKey === 'SPEED_UP') {
+      ball.speedMult = 1.45;
+      setTimeout(() => { ball.speedMult = 1; }, info.duration);
+    }
+    if (typeKey === 'SLOW_MO') {
+      const oldSpeed = opp === p1 ? Paddle.speed : Paddle.aiSpeedBase;
+      const isAI = opp === p2;
+      if (isAI) opp.aiSlow = 0.55; else opp.playerSlow = 0.55;
+      setTimeout(() => { if (isAI) opp.aiSlow = 1; else opp.playerSlow = 1; }, info.duration);
+    }
+  }
+
+  function expirePowers() {
+    const now = performance.now();
+    if (State.activePowers.player && now > State.activePowers.player.until) {
+      State.activePowers.player.info.reset(p1);
+      State.activePowers.player = null;
+    }
+    if (State.activePowers.ai && now > State.activePowers.ai.until) {
+      State.activePowers.ai.info.reset(p2);
+      State.activePowers.ai = null;
+    }
+  }
+
+  function clampPaddle(p) {
+    const hh = p.h / 2;
+    if (p.y < hh) p.y = hh;
+    if (p.y > BASE_H - hh) p.y = BASE_H - hh;
+  }
+
+  function updateInput() {
+    // Keyboard
+    let targetY = p1.y;
+    if (keys['ArrowUp'] || keys['w'] || keys['W']) targetY -= Paddle.speed;
+    if (keys['ArrowDown'] || keys['s'] || keys['S']) targetY += Paddle.speed;
+    if (usingTouch) targetY = touchY;
+    else targetY = mouseY;
+    p1.y += (targetY - p1.y) * 0.28;
+    clampPaddle(p1);
+
+    // AI
+    const diff = ball.y - p2.y;
+    const aiSpeed = Paddle.aiSpeedBase * (1 + State.level * 0.08) * (p2.aiSlow || 1);
+    const err = 18 * (1 - Math.min(1, State.level * 0.1));
+    if (Math.abs(diff) > err) {
+      p2.y += Math.sign(diff) * aiSpeed;
+    }
+    clampPaddle(p2);
+  }
+
+  function updateBall() {
+    const speedMult = ball.speedMult || 1;
+    ball.x += ball.vx * speedMult;
+    ball.y += ball.vy * speedMult;
+    ball.spin *= 0.99;
+
+    // Trail
+    ball.trail.push({ x: ball.x, y: ball.y, alpha: 1 });
+    if (ball.trail.length > 14) ball.trail.shift();
+
+    // Wall bounces
+    if (ball.y - ball.r < 0) { ball.y = ball.r; ball.vy = Math.abs(ball.vy); sfx('wall'); State.shake = 4; }
+    if (ball.y + ball.r > BASE_H) { ball.y = BASE_H - ball.r; ball.vy = -Math.abs(ball.vy); sfx('wall'); State.shake = 4; }
+
+    // Paddle collisions
+    const p1Hit = ball.x - ball.r < p1.x + p1.w / 2 && ball.x + ball.r > p1.x - p1.w / 2 &&
+                  ball.y > p1.y - p1.h / 2 - ball.r && ball.y < p1.y + p1.h / 2 + ball.r && ball.vx < 0;
+    const p2Hit = ball.x + ball.r > p2.x - p2.w / 2 && ball.x - ball.r < p2.x + p2.w / 2 &&
+                  ball.y > p2.y - p2.h / 2 - ball.r && ball.y < p2.y + p2.h / 2 + ball.r && ball.vx > 0;
+
+    if (p1Hit || p2Hit) {
+      const p = p1Hit ? p1 : p2;
+      const side = p1Hit ? 1 : -1;
+      const rel = (ball.y - p.y) / (p.h / 2);
+      const maxAngle = Math.PI / 2.8;
+      const angle = rel * maxAngle;
+      const speed = Math.min(Ball.speedMax, Math.hypot(ball.vx, ball.vy) * 1.06 + 0.4);
+      ball.vx = side * speed * Math.cos(angle);
+      ball.vy = speed * Math.sin(angle);
+      ball.spin = rel * 0.3;
+      // slight y correction to prevent sticking
+      ball.x = p.x + side * (p.w / 2 + ball.r + 2);
+      sfx('paddle');
+      State.shake = 6;
+      spawnParticles(ball.x, ball.y, '#00ff88', 14);
+
+      // Power-up effect chance
+      if (Math.random() < 0.12) maybeSpawnPowerup(ball.x, ball.y);
+    }
+
+    // Score
+    if (ball.x < -ball.r) {
+      State.scoreAI++;
+      sfx('score');
+      spawnMessage('AI POINT', BASE_W / 2, BASE_H / 2, '#ff4d4d');
+      checkWin();
+      State.servedBy = -1;
+      if (State.mode === 'play') { State.mode = 'serve'; autoServeIfAI(); }
+      resetBall(-1);
+    } else if (ball.x > BASE_W + ball.r) {
+      State.scorePlayer++;
+      sfx('score');
+      spawnMessage('PLAYER POINT', BASE_W / 2, BASE_H / 2, '#00ff88');
+      checkWin();
+      State.servedBy = 1;
+      if (State.mode === 'play') State.mode = 'serve';
+      resetBall(1);
+    }
+  }
+
+  function checkWin() {
+    if (State.scorePlayer >= State.winningScore || State.scoreAI >= State.winningScore) {
+      State.mode = 'over';
+      sfx('explode');
+      spawnParticles(BASE_W / 2, BASE_H / 2, '#ffcc00', 80);
+    }
+  }
+
+  function updatePowerups() {
+    for (let i = State.powerups.length - 1; i >= 0; i--) {
+      const pw = State.powerups[i];
+      pw.x += pw.vx; pw.y += pw.vy; pw.life--;
+      pw.pulse += 0.12;
+      // Collect by player
+      if (pw.x > p1.x - p1.w / 2 - 10 && pw.x < p1.x + p1.w / 2 + 10 &&
+          pw.y > p1.y - p1.h / 2 && pw.y < p1.y + p1.h / 2) {
+        applyPowerup('player', pw.type);
+        State.powerups.splice(i, 1);
+        continue;
+      }
+      // AI collects sometimes if on its side
+      if (pw.x > p2.x - p2.w / 2 - 10 && pw.x < p2.x + p2.w / 2 + 10 &&
+          pw.y > p2.y - p2.h / 2 && pw.y < p2.y + p2.h / 2 && Math.random() < 0.6) {
+        applyPowerup('ai', pw.type);
+        State.powerups.splice(i, 1);
+        continue;
+      }
+      if (pw.life <= 0 || pw.y > BASE_H + 20 || pw.x < -20 || pw.x > BASE_W + 20) {
+        State.powerups.splice(i, 1);
+      }
+    }
+  }
+
+  function updateParticles() {
+    for (let i = State.particles.length - 1; i >= 0; i--) {
+      const pt = State.particles[i];
+      pt.x += pt.vx; pt.y += pt.vy; pt.life--;
+      pt.vy *= 0.96; pt.vx *= 0.96;
+      if (pt.life <= 0) State.particles.splice(i, 1);
+    }
+    for (let i = State.messages.length - 1; i >= 0; i--) {
+      const m = State.messages[i];
+      m.y -= 0.6; m.life--;
+      if (m.life <= 0) State.messages.splice(i, 1);
+    }
+  }
+
+  function update() {
+    if (State.mode === 'play') {
+      updateInput();
+      updateBall();
+      updatePowerups();
+      expirePowers();
+      updateParticles();
+      if (State.shake > 0) State.shake *= 0.85;
+      if (State.shake < 0.5) State.shake = 0;
+    } else if (State.mode === 'serve') {
+      updateInput();
+      expirePowers();
+      updateParticles();
+      // ball floats in place until serve
+      ball.y = BASE_H / 2 + Math.sin(performance.now() / 300) * 8;
+      if (State.servedBy === 1) ball.x = p1.x + 48;
+      else ball.x = p2.x - 48;
+    } else if (State.mode === 'title' || State.mode === 'over') {
+      updateParticles();
+    }
+  }
+
+  function drawRoundedRect(x, y, w, h, r, fill, glow) {
+    ctx.save();
+    ctx.translate(x * SCALE, y * SCALE);
+    ctx.scale(SCALE, SCALE);
+    ctx.beginPath();
+    ctx.moveTo(-w / 2 + r, -h / 2);
+    ctx.lineTo(w / 2 - r, -h / 2);
+    ctx.quadraticCurveTo(w / 2, -h / 2, w / 2, -h / 2 + r);
+    ctx.lineTo(w / 2, h / 2 - r);
+    ctx.quadraticCurveTo(w / 2, h / 2, w / 2 - r, h / 2);
+    ctx.lineTo(-w / 2 + r, h / 2);
+    ctx.quadraticCurveTo(-w / 2, h / 2, -w / 2, h / 2 - r);
+    ctx.lineTo(-w / 2, -h / 2 + r);
+    ctx.quadraticCurveTo(-w / 2, -h / 2, -w / 2 + r, -h / 2);
+    ctx.closePath();
+    if (glow) {
+      ctx.shadowColor = glow;
+      ctx.shadowBlur = 18;
+    }
+    ctx.fillStyle = fill;
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function drawBall() {
+    // trail
+    for (let i = 0; i < ball.trail.length; i++) {
+      const t = ball.trail[i];
+      const alpha = (i / ball.trail.length) * 0.45;
+      ctx.beginPath();
+      ctx.arc(t.x * SCALE, t.y * SCALE, (ball.r - 1) * SCALE, 0, Math.PI * 2);
+      ctx.fillStyle = `rgba(0,255,136,${alpha})`;
+      ctx.fill();
+    }
+    ctx.beginPath();
+    ctx.arc(ball.x * SCALE, ball.y * SCALE, ball.r * SCALE, 0, Math.PI * 2);
+    ctx.fillStyle = '#e7fae3';
+    ctx.shadowColor = '#00ff88';
+    ctx.shadowBlur = 22;
+    ctx.fill();
+    ctx.shadowBlur = 0;
+  }
+
+  function drawPowerups() {
+    for (const pw of State.powerups) {
+      const pulse = 1 + Math.sin(pw.pulse) * 0.2;
+      ctx.save();
+      ctx.translate(pw.x * SCALE, pw.y * SCALE);
+      ctx.scale(SCALE * pulse, SCALE * pulse);
+      ctx.fillStyle = POWERS[pw.type].color;
+      ctx.shadowColor = POWERS[pw.type].color;
+      ctx.shadowBlur = 14;
+      ctx.beginPath();
+      ctx.arc(0, 0, 10, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#050407';
+      ctx.font = 'bold 8px Courier New';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(POWERS[pw.type].label, 0, 0);
+      ctx.restore();
+    }
+  }
+
+  function drawParticles() {
+    for (const pt of State.particles) {
+      const alpha = pt.life / 50;
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle = pt.color;
+      ctx.beginPath();
+      ctx.arc(pt.x * SCALE, pt.y * SCALE, pt.size * SCALE, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawMessages() {
+    for (const m of State.messages) {
+      const alpha = Math.min(1, m.life / 20);
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle = m.color;
+      ctx.font = `bold ${Math.floor(16 * SCALE)}px Courier New`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.shadowColor = m.color;
+      ctx.shadowBlur = 10;
+      ctx.fillText(m.text, m.x * SCALE, m.y * SCALE);
+      ctx.shadowBlur = 0;
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawHUD() {
+    ctx.fillStyle = '#2f4a3d';
+    ctx.font = `bold ${Math.floor(52 * SCALE)}px Courier New`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'top';
+    ctx.shadowColor = '#00ff88';
+    ctx.shadowBlur = 10;
+    ctx.fillText(State.scorePlayer, BASE_W * SCALE * 0.25, 18 * SCALE);
+    ctx.fillStyle = '#5a3d3d';
+    ctx.shadowColor = '#ff4d4d';
+    ctx.fillText(State.scoreAI, BASE_W * SCALE * 0.75, 18 * SCALE);
+    ctx.shadowBlur = 0;
+
+    // Active powers indicator
+    ctx.font = `bold ${Math.floor(12 * SCALE)}px Courier New`;
+    let yOff = 70 * SCALE;
+    if (State.activePowers.player) {
+      const left = (State.activePowers.player.until - performance.now()) / State.activePowers.player.info.duration;
+      ctx.fillStyle = State.activePowers.player.info.color;
+      ctx.fillText(`${State.activePowers.player.info.label} ${(left * 100).toFixed(0)}%`, BASE_W * SCALE * 0.12, yOff);
+      yOff += 16 * SCALE;
+    }
+    if (State.activePowers.ai) {
+      const left = (State.activePowers.ai.until - performance.now()) / State.activePowers.ai.info.duration;
+      ctx.fillStyle = State.activePowers.ai.info.color;
+      ctx.fillText(`${State.activePowers.ai.info.label} ${(left * 100).toFixed(0)}%`, BASE_W * SCALE * 0.88, 70 * SCALE);
+    }
+
+    // Center line
+    ctx.strokeStyle = 'rgba(0,255,128,0.12)';
+    ctx.lineWidth = 2 * SCALE;
+    ctx.setLineDash([8 * SCALE, 12 * SCALE]);
+    ctx.beginPath();
+    ctx.moveTo(BASE_W * SCALE / 2, 0);
+    ctx.lineTo(BASE_W * SCALE / 2, BASE_H * SCALE);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Level badge
+    ctx.fillStyle = '#4d6b5a';
+    ctx.font = `bold ${Math.floor(14 * SCALE)}px Courier New`;
+    ctx.fillText(`LEVEL ${State.level}`, BASE_W * SCALE / 2, 22 * SCALE);
+  }
+
+  function drawTitle() {
+    const cy = BASE_H * SCALE / 2;
+    ctx.fillStyle = '#e7fae3';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = `bold ${Math.floor(46 * SCALE)}px Courier New`;
+    ctx.shadowColor = '#00ff88';
+    ctx.shadowBlur = 24;
+    ctx.fillText('NEON PULSE PONG', BASE_W * SCALE / 2, cy - 42 * SCALE);
+    ctx.shadowBlur = 0;
+    ctx.font = `bold ${Math.floor(16 * SCALE)}px Courier New`;
+    ctx.fillStyle = '#7a9a88';
+    ctx.fillText('Click or press ENTER to start', BASE_W * SCALE / 2, cy + 18 * SCALE);
+    ctx.font = `bold ${Math.floor(12 * SCALE)}px Courier New`;
+    ctx.fillText('First to 7 wins • Power-ups fall on long rallies', BASE_W * SCALE / 2, cy + 48 * SCALE);
+  }
+
+  function drawGameOver() {
+    const cy = BASE_H * SCALE / 2;
+    ctx.fillStyle = '#e7fae3';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = `bold ${Math.floor(42 * SCALE)}px Courier New`;
+    ctx.shadowColor = State.scorePlayer > State.scoreAI ? '#00ff88' : '#ff4d4d';
+    ctx.shadowBlur = 24;
+    const result = State.scorePlayer > State.scoreAI ? 'YOU WIN' : 'AI WINS';
+    ctx.fillText(result, BASE_W * SCALE / 2, cy - 38 * SCALE);
+    ctx.shadowBlur = 0;
+    ctx.font = `bold ${Math.floor(16 * SCALE)}px Courier New`;
+    ctx.fillStyle = '#7a9a88';
+    ctx.fillText('Click or press ENTER to play again', BASE_W * SCALE / 2, cy + 22 * SCALE);
+  }
+
+  function drawServeHint() {
+    ctx.fillStyle = '#7a9a88';
+    ctx.font = `bold ${Math.floor(14 * SCALE)}px Courier New`;
+    ctx.textAlign = 'center';
+    ctx.fillText(State.servedBy === 1 ? 'Click / ENTER to serve' : 'AI serving...', BASE_W * SCALE / 2, BASE_H * SCALE - 32 * SCALE);
+  }
+
+  function render() {
+    ctx.save();
+    if (State.shake > 0) {
+      ctx.translate((Math.random() - 0.5) * State.shake * SCALE, (Math.random() - 0.5) * State.shake * SCALE);
+    }
+
+    // Background
+    ctx.fillStyle = '#050407';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // Grid overlay (very subtle)
+    ctx.strokeStyle = 'rgba(0,255,128,0.035)';
+    ctx.lineWidth = 1;
+    const gridSize = 40 * SCALE;
+    for (let x = 0; x < canvas.width; x += gridSize) {
+      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, canvas.height); ctx.stroke();
+    }
+    for (let y = 0; y < canvas.height; y += gridSize) {
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(canvas.width, y); ctx.stroke();
+    }
+
+    // Paddles
+    drawRoundedRect(p1.x, p1.y, p1.w, p1.h, 4, '#00ff88', '#00ff88');
+    drawRoundedRect(p2.x, p2.y, p2.w, p2.h, 4, '#ff4d4d', '#ff4d4d');
+
+    if (State.mode === 'title') {
+      drawTitle();
+    } else if (State.mode === 'over') {
+      drawHUD();
+      drawGameOver();
+    } else {
+      drawBall();
+      drawPowerups();
+      drawHUD();
+      drawServeHint();
+    }
+
+    drawParticles();
+    drawMessages();
+
+    // Vignette
+    const grad = ctx.createRadialGradient(canvas.width / 2, canvas.height / 2, canvas.height * 0.35,
+                                          canvas.width / 2, canvas.height / 2, canvas.height * 0.85);
+    grad.addColorStop(0, 'rgba(0,0,0,0)');
+    grad.addColorStop(1, 'rgba(0,0,0,0.45)');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    ctx.restore();
+  }
+
+  function loop(now) {
+    if (!State.lastTime) State.lastTime = now;
+    let dt = now - State.lastTime;
+    State.lastTime = now;
+    if (dt > 100) dt = 100;
+    State.accumulator += dt;
+    while (State.accumulator >= State.dt) {
+      update();
+      State.accumulator -= State.dt;
+    }
+    if (audioCtx) scheduleMusic(audioCtx.currentTime);
+    render();
+    requestAnimationFrame(loop);
+  }
+
+  function autoServeIfAI() {
+    if (State.mode === 'serve' && State.servedBy === -1) {
+      setTimeout(() => { if (State.mode === 'serve') State.mode = 'play'; }, 700 + Math.random() * 600);
+    }
+  }
+
+  function startGame() {
+    startAudio();
+    resetGame();
+    State.mode = 'serve';
+    autoServeIfAI();
+  }
+
+  function serveOrRestart() {
+    startAudio();
+    if (State.mode === 'title' || State.mode === 'over') {
+      startGame();
+    } else if (State.mode === 'serve' && State.servedBy === 1) {
+      State.mode = 'play';
+    }
+  }
+
+  // Input listeners
+  window.addEventListener('keydown', e => {
+    keys[e.key] = true;
+    if (e.key === 'Enter' || e.key === ' ') serveOrRestart();
+  });
+  window.addEventListener('keyup', e => { keys[e.key] = false; });
+
+  canvas.addEventListener('mousemove', e => {
+    const rect = canvas.getBoundingClientRect();
+    const y = (e.clientY - rect.top) / SCALE;
+    mouseY = Math.max(Paddle.h / 2, Math.min(BASE_H - Paddle.h / 2, y));
+    usingTouch = false;
+  });
+
+  canvas.addEventListener('touchstart', e => {
+    usingTouch = true;
+    const rect = canvas.getBoundingClientRect();
+    touchY = (e.touches[0].clientY - rect.top) / SCALE;
+    serveOrRestart();
+    e.preventDefault();
+  }, { passive: false });
+  canvas.addEventListener('touchmove', e => {
+    usingTouch = true;
+    const rect = canvas.getBoundingClientRect();
+    touchY = (e.touches[0].clientY - rect.top) / SCALE;
+    e.preventDefault();
+  }, { passive: false });
+  canvas.addEventListener('click', () => serveOrRestart());
+
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
