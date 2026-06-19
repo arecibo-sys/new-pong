@@ -292,133 +292,6 @@
     stepIdx = 0; barIdx = 0; filterSweepVal = 0;
   }
 
-  // ========== AGENT LOOP SYSTEM ==========
-  // A self-running loop observes game state, proposes improvements, evaluates,
-  // and applies lightweight patches to the live game. Inspired by Boris Cherny's
-  // "my job is to write loops" principle (Claude Code & the Future of Engineering).
-  // This first implementation uses a hard-coded set of tuning rules; future
-  // versions can replace the rule table with an LLM-based planner.
-
-  const GameLoop = {
-    enabled: true,
-    intervalMs: 2000,
-    lastRun: 0,
-    metrics: { rallies: 0, paddleHits: 0, aiPoints: 0, playerPoints: 0, avgRallyLength: 0 },
-    history: [], // recent observations
-    rules: [],
-    pending: null
-  };
-
-  function observe() {
-    const total = State.scorePlayer + State.scoreAI;
-    const avgRally = total > 0 ? GameLoop.metrics.rallies / Math.max(1, total) : 0;
-    return {
-      scoreDiff: State.scorePlayer - State.scoreAI,
-      totalPoints: total,
-      avgRallyLength: avgRally,
-      paddleHits: GameLoop.metrics.paddleHits,
-      aiSpeed: Paddle.aiSpeedBase * (1 + State.level * 0.08),
-      ballSpeed: Math.hypot(ball.vx, ball.vy),
-      powerupsOnField: State.powerups.length,
-      playerWinning: State.scorePlayer >= State.winningScore,
-      aiWinning: State.scoreAI >= State.winningScore
-    };
-  }
-
-  function plan(obs) {
-    const actions = [];
-    // Rule 1: AI too dominant -> slow it slightly and shrink AI paddle
-    if (obs.scoreDiff < -2) {
-      actions.push({ type: 'aiEase', reason: 'AI pulling ahead' });
-    }
-    // Rule 2: Player too dominant -> raise AI speed/level
-    if (obs.scoreDiff > 2) {
-      actions.push({ type: 'aiBoost', reason: 'player pulling ahead' });
-    }
-    // Rule 3: Rallies are short -> slow ball a touch and shrink paddles
-    if (obs.avgRallyLength < 2 && obs.totalPoints > 3) {
-      actions.push({ type: 'lengthenRallies', reason: 'rallies too short' });
-    }
-    // Rule 4: Rallies are very long -> speed up ball and level up AI
-    if (obs.avgRallyLength > 8 && obs.totalPoints > 3) {
-      actions.push({ type: 'raiseStakes', reason: 'rallies very long' });
-    }
-    // Rule 5: Few powerups used -> increase spawn chance
-    if (obs.powerupsOnField === 0 && obs.paddleHits > 20) {
-      actions.push({ type: 'morePowerups', reason: 'powerups underused' });
-    }
-    return actions;
-  }
-
-  function act(actions) {
-    let report = [];
-    for (const a of actions) {
-      if (a.type === 'aiEase') {
-        Paddle.aiSpeedBase = Math.max(4.8, Paddle.aiSpeedBase - 0.25);
-        report.push('AI eased');
-      } else if (a.type === 'aiBoost') {
-        State.level = Math.min(5, State.level + 1);
-        Paddle.aiSpeedBase = Math.min(8.5, Paddle.aiSpeedBase + 0.25);
-        report.push('AI boosted to level ' + State.level);
-      } else if (a.type === 'lengthenRallies') {
-        Ball.speedBase = Math.max(7.5, Ball.speedBase - 0.4);
-        Ball.speedMax = Math.max(15, Ball.speedMax - 0.6);
-        Paddle.h = Math.max(62, Paddle.h - 2);
-        report.push('Ball & paddles tuned for longer rallies');
-      } else if (a.type === 'raiseStakes') {
-        Ball.speedBase = Math.min(12, Ball.speedBase + 0.4);
-        Ball.speedMax = Math.min(24, Ball.speedMax + 0.6);
-        State.level = Math.min(5, State.level + 1);
-        report.push('Stakes raised');
-      } else if (a.type === 'morePowerups') {
-        // Increase drop chance for the next window
-        GameLoop.powerupBoost = 3;
-        report.push('Powerup spawn window opened');
-      }
-    }
-    return report;
-  }
-
-  function evaluate(obs, actions, results) {
-    const score = Math.abs(obs.scoreDiff) <= 1 ? 2 : Math.abs(obs.scoreDiff) <= 3 ? 1 : 0;
-    const rallyScore = obs.avgRallyLength >= 2 && obs.avgRallyLength <= 8 ? 2 : 1;
-    return {
-      scoreBalance: score,
-      rallyHealth: rallyScore,
-      actionsTaken: actions.length,
-      results
-    };
-  }
-
-  function runGameLoop(now) {
-    if (!GameLoop.enabled) return;
-    if (now - GameLoop.lastRun < GameLoop.intervalMs) return;
-    if (State.mode !== 'play' && State.mode !== 'serve') return;
-    GameLoop.lastRun = now;
-
-    const obs = observe();
-    GameLoop.history.push({ time: now, ...obs });
-    if (GameLoop.history.length > 20) GameLoop.history.shift();
-
-    const actions = plan(obs);
-    const results = actions.length ? act(actions) : [];
-    const evalResult = evaluate(obs, actions, results);
-
-    if (results.length) {
-      State.messages.push({ text: 'LOOP: ' + results.join(' • '), x: BASE_W / 2, y: BASE_H * 0.18, life: 180, color: '#00ccff' });
-      // eslint-disable-next-line no-console
-      console.log('[loop]', obs, evalResult);
-    }
-
-    // Decay temporary powerup boost
-    if (GameLoop.powerupBoost > 0) GameLoop.powerupBoost--;
-  }
-
-  // Expose minimal debugging API
-  window.PONG = { State, GameLoop, observe, plan, act, runGameLoop };
-
-  // ========== END AGENT LOOP SYSTEM ==========
-
   // Game state
   const State = {
     mode: 'title', // title, serve, play, over
@@ -717,6 +590,133 @@
       updateParticles();
     }
   }
+
+  // ========== AGENT LOOP SYSTEM ==========
+  // A self-running loop observes game state, proposes improvements, evaluates,
+  // and applies lightweight patches to the live game. Inspired by Boris Cherny's
+  // "my job is to write loops" principle (Claude Code & the Future of Engineering).
+  // This first implementation uses a hard-coded set of tuning rules; future
+  // versions can replace the rule table with an LLM-based planner.
+
+  const GameLoop = {
+    enabled: true,
+    intervalMs: 2000,
+    lastRun: 0,
+    metrics: { rallies: 0, paddleHits: 0, aiPoints: 0, playerPoints: 0, avgRallyLength: 0 },
+    history: [], // recent observations
+    rules: [],
+    pending: null
+  };
+
+  function observe() {
+    const total = State.scorePlayer + State.scoreAI;
+    const avgRally = total > 0 ? GameLoop.metrics.rallies / Math.max(1, total) : 0;
+    return {
+      scoreDiff: State.scorePlayer - State.scoreAI,
+      totalPoints: total,
+      avgRallyLength: avgRally,
+      paddleHits: GameLoop.metrics.paddleHits,
+      aiSpeed: Paddle.aiSpeedBase * (1 + State.level * 0.08),
+      ballSpeed: Math.hypot(ball.vx, ball.vy),
+      powerupsOnField: State.powerups.length,
+      playerWinning: State.scorePlayer >= State.winningScore,
+      aiWinning: State.scoreAI >= State.winningScore
+    };
+  }
+
+  function plan(obs) {
+    const actions = [];
+    // Rule 1: AI too dominant -> slow it slightly and shrink AI paddle
+    if (obs.scoreDiff < -2) {
+      actions.push({ type: 'aiEase', reason: 'AI pulling ahead' });
+    }
+    // Rule 2: Player too dominant -> raise AI speed/level
+    if (obs.scoreDiff > 2) {
+      actions.push({ type: 'aiBoost', reason: 'player pulling ahead' });
+    }
+    // Rule 3: Rallies are short -> slow ball a touch and shrink paddles
+    if (obs.avgRallyLength < 2 && obs.totalPoints > 3) {
+      actions.push({ type: 'lengthenRallies', reason: 'rallies too short' });
+    }
+    // Rule 4: Rallies are very long -> speed up ball and level up AI
+    if (obs.avgRallyLength > 8 && obs.totalPoints > 3) {
+      actions.push({ type: 'raiseStakes', reason: 'rallies very long' });
+    }
+    // Rule 5: Few powerups used -> increase spawn chance
+    if (obs.powerupsOnField === 0 && obs.paddleHits > 20) {
+      actions.push({ type: 'morePowerups', reason: 'powerups underused' });
+    }
+    return actions;
+  }
+
+  function act(actions) {
+    let report = [];
+    for (const a of actions) {
+      if (a.type === 'aiEase') {
+        Paddle.aiSpeedBase = Math.max(4.8, Paddle.aiSpeedBase - 0.25);
+        report.push('AI eased');
+      } else if (a.type === 'aiBoost') {
+        State.level = Math.min(5, State.level + 1);
+        Paddle.aiSpeedBase = Math.min(8.5, Paddle.aiSpeedBase + 0.25);
+        report.push('AI boosted to level ' + State.level);
+      } else if (a.type === 'lengthenRallies') {
+        Ball.speedBase = Math.max(7.5, Ball.speedBase - 0.4);
+        Ball.speedMax = Math.max(15, Ball.speedMax - 0.6);
+        Paddle.h = Math.max(62, Paddle.h - 2);
+        report.push('Ball & paddles tuned for longer rallies');
+      } else if (a.type === 'raiseStakes') {
+        Ball.speedBase = Math.min(12, Ball.speedBase + 0.4);
+        Ball.speedMax = Math.min(24, Ball.speedMax + 0.6);
+        State.level = Math.min(5, State.level + 1);
+        report.push('Stakes raised');
+      } else if (a.type === 'morePowerups') {
+        // Increase drop chance for the next window
+        GameLoop.powerupBoost = 3;
+        report.push('Powerup spawn window opened');
+      }
+    }
+    return report;
+  }
+
+  function evaluate(obs, actions, results) {
+    const score = Math.abs(obs.scoreDiff) <= 1 ? 2 : Math.abs(obs.scoreDiff) <= 3 ? 1 : 0;
+    const rallyScore = obs.avgRallyLength >= 2 && obs.avgRallyLength <= 8 ? 2 : 1;
+    return {
+      scoreBalance: score,
+      rallyHealth: rallyScore,
+      actionsTaken: actions.length,
+      results
+    };
+  }
+
+  function runGameLoop(now) {
+    if (!GameLoop.enabled) return;
+    if (now - GameLoop.lastRun < GameLoop.intervalMs) return;
+    if (State.mode !== 'play' && State.mode !== 'serve') return;
+    GameLoop.lastRun = now;
+
+    const obs = observe();
+    GameLoop.history.push({ time: now, ...obs });
+    if (GameLoop.history.length > 20) GameLoop.history.shift();
+
+    const actions = plan(obs);
+    const results = actions.length ? act(actions) : [];
+    const evalResult = evaluate(obs, actions, results);
+
+    if (results.length) {
+      State.messages.push({ text: 'LOOP: ' + results.join(' • '), x: BASE_W / 2, y: BASE_H * 0.18, life: 180, color: '#00ccff' });
+      // eslint-disable-next-line no-console
+      console.log('[loop]', obs, evalResult);
+    }
+
+    // Decay temporary powerup boost
+    if (GameLoop.powerupBoost > 0) GameLoop.powerupBoost--;
+  }
+
+  // Expose minimal debugging API
+  window.PONG = { State, GameLoop, observe, plan, act, runGameLoop };
+
+  // ========== END AGENT LOOP SYSTEM ==========
 
   function drawRoundedRect(x, y, w, h, r, fill, glow) {
     ctx.save();
