@@ -405,7 +405,7 @@
     const evalResult = evaluate(obs, actions, results);
 
     if (results.length) {
-      spawnMessage('LOOP: ' + results.join(' • '), BASE_W / 2, BASE_H * 0.18, '#00ccff');
+      State.messages.push({ text: 'LOOP: ' + results.join(' • '), x: BASE_W / 2, y: BASE_H * 0.18, life: 180, color: '#00ccff' });
       // eslint-disable-next-line no-console
       console.log('[loop]', obs, evalResult);
     }
@@ -413,6 +413,9 @@
     // Decay temporary powerup boost
     if (GameLoop.powerupBoost > 0) GameLoop.powerupBoost--;
   }
+
+  // Expose minimal debugging API
+  window.PONG = { State, GameLoop, observe, plan, act, runGameLoop };
 
   // ========== END AGENT LOOP SYSTEM ==========
 
